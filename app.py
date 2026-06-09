@@ -217,52 +217,102 @@ google = oauth.register(
 app.config['REMEMBER_COOKIE_DURATION'] = datetime.timedelta(days=30)
 app.config['PERMANENT_SESSION_LIFETIME'] = datetime.timedelta(days=30)
 
-# --- Direct SMTP Email Engine (bypasses flask-mail for reliability) ---
+# --- Email Engine: Resend HTTP API (primary) + SMTP (fallback for local dev) ---
 
-def _smtp_send(subject, recipient, html_body, attachments=None):
-    """Internal: Sends email via smtplib with a 15-second timeout. Runs in background thread."""
+def _send_via_resend(api_key, subject, recipient, html_body, attachments=None):
+    """Send email using Resend HTTP API (uses HTTPS port 443, works on all hosting)."""
+    import base64
+    sender = os.getenv('RESEND_SENDER', os.getenv('MAIL_DEFAULT_SENDER', 'Cricza <onboarding@resend.dev>'))
+
+    # Replace embedded cid:logo with hosted URL so logo displays in email
+    html_body = html_body.replace('cid:logo', 'https://cricza.indiecode.in/static/image/logo.png')
+
+    payload = {
+        'from': sender,
+        'to': [recipient],
+        'subject': subject,
+        'html': html_body
+    }
+
+    # Add file attachments (for backup emails)
+    if attachments:
+        resend_atts = []
+        for att in attachments:
+            if att['type'] == 'file':
+                resend_atts.append({
+                    'filename': att.get('filename', 'attachment'),
+                    'content': base64.b64encode(att['data']).decode('utf-8')
+                })
+        if resend_atts:
+            payload['attachments'] = resend_atts
+
+    import requests as http_req
+    resp = http_req.post(
+        'https://api.resend.com/emails',
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json'
+        },
+        json=payload,
+        timeout=15
+    )
+
+    if resp.status_code in [200, 201]:
+        print(f"[EMAIL OK] Sent via Resend to {recipient}: {subject}", flush=True)
+    else:
+        raise Exception(f"Resend API {resp.status_code}: {resp.text}")
+
+
+def _send_via_smtp(subject, recipient, html_body, attachments=None):
+    """Send email via direct SMTP with timeout (for local development)."""
+    server_host = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
+    port = int(os.getenv('MAIL_PORT', 465))
+    use_ssl = str(os.getenv('MAIL_USE_SSL', 'True')).lower() in ['true', '1', 't']
+    use_tls = str(os.getenv('MAIL_USE_TLS', 'False')).lower() in ['true', '1', 't']
+    username = os.getenv('MAIL_USERNAME', '')
+    password = os.getenv('MAIL_PASSWORD', '')
+    sender = os.getenv('MAIL_DEFAULT_SENDER', username)
+
+    msg = MIMEMultipart('related')
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg.attach(MIMEText(html_body, 'html'))
+
+    if attachments:
+        for att in attachments:
+            if att['type'] == 'image':
+                img = MIMEImage(att['data'])
+                img.add_header('Content-ID', att.get('content_id', '<logo>'))
+                img.add_header('Content-Disposition', 'inline', filename=att.get('filename', 'image.png'))
+                msg.attach(img)
+            elif att['type'] == 'file':
+                part = MIMEApplication(att['data'])
+                part.add_header('Content-Disposition', 'attachment', filename=att.get('filename', 'file'))
+                msg.attach(part)
+
+    if use_ssl:
+        smtp_conn = smtplib.SMTP_SSL(server_host, port, timeout=15)
+    else:
+        smtp_conn = smtplib.SMTP(server_host, port, timeout=15)
+        if use_tls:
+            smtp_conn.starttls()
+
+    smtp_conn.login(username, password)
+    smtp_conn.sendmail(sender, [recipient], msg.as_string())
+    smtp_conn.quit()
+    print(f"[EMAIL OK] Sent via SMTP to {recipient}: {subject}", flush=True)
+
+
+def _dispatch_email(subject, recipient, html_body, attachments=None):
+    """Routes email to Resend API (if configured) or SMTP. Runs in background thread."""
     print(f"[EMAIL] Attempting to send to {recipient}: {subject}", flush=True)
     try:
-        server_host = os.getenv('MAIL_SERVER', 'smtp.gmail.com')
-        port = int(os.getenv('MAIL_PORT', 465))
-        use_ssl = str(os.getenv('MAIL_USE_SSL', 'True')).lower() in ['true', '1', 't']
-        use_tls = str(os.getenv('MAIL_USE_TLS', 'False')).lower() in ['true', '1', 't']
-        username = os.getenv('MAIL_USERNAME', '')
-        password = os.getenv('MAIL_PASSWORD', '')
-        sender = os.getenv('MAIL_DEFAULT_SENDER', username)
-
-        # Build the email message
-        msg = MIMEMultipart('related')
-        msg['Subject'] = subject
-        msg['From'] = sender
-        msg['To'] = recipient
-        msg.attach(MIMEText(html_body, 'html'))
-
-        # Attach files (logo, excel, etc.)
-        if attachments:
-            for att in attachments:
-                if att['type'] == 'image':
-                    img = MIMEImage(att['data'])
-                    img.add_header('Content-ID', att.get('content_id', '<logo>'))
-                    img.add_header('Content-Disposition', 'inline', filename=att.get('filename', 'image.png'))
-                    msg.attach(img)
-                elif att['type'] == 'file':
-                    part = MIMEApplication(att['data'])
-                    part.add_header('Content-Disposition', 'attachment', filename=att.get('filename', 'file'))
-                    msg.attach(part)
-
-        # Connect with a 15-second timeout (prevents infinite hang on blocked ports)
-        if use_ssl:
-            smtp_conn = smtplib.SMTP_SSL(server_host, port, timeout=15)
+        resend_api_key = os.getenv('RESEND_API_KEY')
+        if resend_api_key:
+            _send_via_resend(resend_api_key, subject, recipient, html_body, attachments)
         else:
-            smtp_conn = smtplib.SMTP(server_host, port, timeout=15)
-            if use_tls:
-                smtp_conn.starttls()
-
-        smtp_conn.login(username, password)
-        smtp_conn.sendmail(sender, [recipient], msg.as_string())
-        smtp_conn.quit()
-        print(f"[EMAIL OK] Sent to {recipient}: {subject}", flush=True)
+            _send_via_smtp(subject, recipient, html_body, attachments)
     except Exception as e:
         error_msg = f"[{datetime.datetime.now()}] Email to {recipient} failed: {str(e)}\n"
         print(error_msg, flush=True)
@@ -289,13 +339,13 @@ def send_email(subject, recipient, template, **kwargs):
                     'filename': 'logo.png'
                 })
 
-        thr = Thread(target=_smtp_send, args=(subject, recipient, html_body, attachments))
+        thr = Thread(target=_dispatch_email, args=(subject, recipient, html_body, attachments))
         thr.daemon = True
         thr.start()
         return True
     except Exception as e:
         error_msg = f"[{datetime.datetime.now()}] Failed to prepare email to {recipient}: {str(e)}\n"
-        print(error_msg)
+        print(error_msg, flush=True)
         with open("email_error.log", "a") as f:
             f.write(error_msg)
         return False
@@ -319,7 +369,7 @@ def send_backup_email(subject, recipient, filename):
                     'filename': filename
                 })
 
-        thr = Thread(target=_smtp_send, args=(subject, recipient, html_body, attachments))
+        thr = Thread(target=_dispatch_email, args=(subject, recipient, html_body, attachments))
         thr.daemon = True
         thr.start()
         return True
